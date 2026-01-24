@@ -1,0 +1,49 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(package-lock\.json|.*\.svg)$
+      - id: end-of-file-fixer
+        exclude: ^(package-lock\.json|.*\.svg)$
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-json
+        exclude: ^(.vscode/.*\.json)$
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: detect-private-key
+        exclude: ^(.*\.test\.ts|.*\.spec\.ts)
+
+  - repo: local
+    hooks:
+      - id: typescript-check-app
+        name: TypeScript check (app)
+        entry: bash -c 'cd app && npx svelte-kit sync && npx svelte-check --tsconfig ./tsconfig.json'
+        language: system
+        types_or: [ts, tsx]
+        pass_filenames: false
+        verbose: true
+        stages: [pre-commit, pre-push, manual]
+
+      - id: biome-check
+        name: Biome lint and format
+        entry: bash -c 'npm run lint:fix'
+        language: system
+        types_or: [javascript, jsx, json, ts, tsx, svelte]
+        pass_filenames: false
+        verbose: true
+        stages: [pre-commit, pre-push, manual]
+
+  - repo: https://github.com/AleksaC/hadolint-py
+    rev: v2.14.0
+    hooks:
+      - id: hadolint
+        name: Lint Dockerfiles
+        files: Dockerfile
+        types: [file]
+        stages: [pre-commit, manual]

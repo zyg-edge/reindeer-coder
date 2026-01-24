@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+.svelte-kit/
+.output/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Deployment config (contains secrets)
+scripts/deploy.config
+!scripts/deploy.config.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+*.db
+
+# Logs
+logs/
+*.log
+
+# Temp files
+terminal_files/
+.linear-agent-temp/
+
+# VSCode extension build
+*.vsix
+scripts/deploy.config
+scripts/github-app-key.pem
