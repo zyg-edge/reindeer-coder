@@ -21,7 +21,6 @@ AI Coding Agents at Scale - Orchestrate coding agents (Claude Code, Gemini CLI, 
 
 ### Linear Integration
 - Write task descriptions in Linear and request implementation plans
-- "Cheap" Claude sessions generate plans without spinning up VMs
 - Review plans via Linear labels before proceeding
 - Label changes trigger automated implementation and PR creation
 - Notifications alert you to blockers or completion
