@@ -1,0 +1,29 @@
+# Linting pipeline using pre-commit hooks
+# Runs the SAME hooks as local development for consistency
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "parent_pipeline"
+    - if: $CI_MERGE_REQUEST_ID
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+stages:
+  - lint
+
+lint:
+  stage: lint
+  image: node:20-bookworm
+  before_script:
+    # Install system dependencies including pip
+    - apt-get update && apt-get install -y git python3 python3-pip make g++
+    # Install pre-commit
+    - pip install pre-commit --break-system-packages
+    # Install all dependencies with npm
+    - npm ci
+    # Install pre-commit hooks
+    - pre-commit install-hooks
+  script:
+    - echo "Running pre-commit hooks on all files"
+    - pre-commit run --all-files --hook-stage manual
