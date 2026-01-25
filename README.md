@@ -1,11 +1,11 @@
 # Reindeer Coder
 
-AI Coding Agents at Scale - Orchestrate Claude Code across cloud VMs with a web dashboard, VS Code extension, and Linear integration.
+AI Coding Agents at Scale - Orchestrate coding agents (Claude Code, Gemini CLI, Codex) across cloud VMs with a web dashboard, VS Code extension, and Linear integration.
 
 ## Features
 
 ### Cloud VM Orchestration
-- Spin up GCP VMs with Claude Code pre-installed
+- Spin up GCP VMs with your chosen coding agent (Claude Code, Gemini CLI, or Codex)
 - Run multiple coding tasks in parallel
 - Automatic resource cleanup after completion
 
@@ -99,11 +99,11 @@ reindeer-coder/
 
 ### How It Works
 
-1. **Task Creation**: Define a coding task with repository URL, branch, and prompt
-2. **VM Provisioning**: GCP Compute Engine VM spins up with Claude Code pre-installed
-3. **Execution**: Claude Code runs autonomously with your specified prompt
+1. **Task Creation**: Define a coding task with repository URL, branch, prompt, and coding agent
+2. **VM Provisioning**: GCP Compute Engine VM spins up with the selected agent pre-installed
+3. **Execution**: The coding agent runs autonomously with your specified prompt
 4. **Monitoring**: Watch progress via real-time terminal streaming
-5. **Intervention**: SSH into the VM anytime to guide or correct the AI
+5. **Intervention**: SSH into the VM anytime to guide or correct the agent
 6. **Completion**: Automated PR/MR creation and resource cleanup
 
 ## Production Deployment
