@@ -195,8 +195,11 @@ const priorityLabels: Record<number, string> = {
 // Fetch Linear issues on mount and load saved form state
 onMount(async () => {
 	loadFormState();
-	// Clear task description but keep other fields
+	// Clear task description and Linear selection (since taskDescription isn't persisted,
+	// we need to clear the selection too to avoid an inconsistent state)
 	taskDescription = '';
+	selectedLinearIssue = null;
+	linearSearch = '';
 	await fetchLinearIssues();
 	await fetchRepositories();
 	await fetchDefaultSystemPrompt();
@@ -370,6 +373,11 @@ async function selectLinearIssue(issue: LinearIssue) {
 	} catch (err) {
 		console.error('Error fetching Linear issue details:', err);
 		linearError = 'Failed to load issue details. Please try again.';
+		// Clear the selection so the form isn't in an inconsistent state
+		selectedLinearIssue = null;
+		linearSearch = '';
+		taskDescription = '';
+		systemPrompt = getBaseSystemPrompt();
 	} finally {
 		loadingLinear = false;
 	}

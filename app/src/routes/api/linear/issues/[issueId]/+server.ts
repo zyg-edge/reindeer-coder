@@ -1,6 +1,6 @@
 import { error, json } from '@sveltejs/kit';
-import { env } from '$env/dynamic/private';
 import { extractBearerToken, isAuthDisabled, verifyToken } from '$lib/server/auth';
+import { getLinearApiKey } from '$lib/server/secrets';
 import type { RequestHandler } from './$types';
 
 interface LinearComment {
@@ -38,8 +38,11 @@ export const GET: RequestHandler = async ({ request, params }) => {
 		throw error(401, 'Invalid token');
 	}
 
-	const linearApiKey = env.LINEAR_API_KEY;
-	if (!linearApiKey) {
+	let linearApiKey: string;
+	try {
+		linearApiKey = await getLinearApiKey();
+	} catch (err) {
+		console.error('Failed to get Linear API key:', err);
 		throw error(500, 'Linear API key not configured');
 	}
 

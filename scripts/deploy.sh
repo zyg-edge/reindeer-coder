@@ -59,6 +59,8 @@ OPTIONS:
     --skip-secrets      Skip secret creation (use existing)
     --from-step N       Resume from step N (1-10)
     --destroy           Destroy all resources (USE WITH CAUTION)
+    --build-image       Build golden VM image with pre-installed tools
+    --rebuild-image     Force rebuild golden image even if it exists
 
 IDEMPOTENCY:
     This script is safe to re-run. It checks if resources exist before creating
@@ -81,6 +83,11 @@ STEPS:
     8. Build and push Docker image
     9. Deploy to Cloud Run
     10. Run database migrations
+
+GOLDEN IMAGE (Optional, for faster VM spin-up):
+    ./scripts/deploy.sh --build-image
+    This creates a pre-configured VM image with all tools installed.
+    VMs boot ~3-4 minutes faster when using the golden image.
 
 MODES:
     Interactive (recommended for first-time setup):
@@ -340,6 +347,8 @@ set_defaults() {
     SKIP_DB="${SKIP_DB:-false}"
     SKIP_SECRETS="${SKIP_SECRETS:-false}"
     DESTROY_MODE="${DESTROY_MODE:-false}"
+    BUILD_IMAGE_MODE="${BUILD_IMAGE_MODE:-false}"
+    REBUILD_IMAGE="${REBUILD_IMAGE:-false}"
 }
 
 #------------------------------------------------------------------------------
@@ -394,6 +403,15 @@ parse_args() {
                 ;;
             --destroy)
                 DESTROY_MODE="true"
+                shift
+                ;;
+            --build-image)
+                BUILD_IMAGE_MODE="true"
+                shift
+                ;;
+            --rebuild-image)
+                BUILD_IMAGE_MODE="true"
+                REBUILD_IMAGE="true"
                 shift
                 ;;
             *)
@@ -909,17 +927,54 @@ setup_database() {
             --format="value(ipAddresses[0].ipAddress)")
 
         # Grant permissions using psql (requires psql to be installed)
+        # For PostgreSQL 15+, we need to make the IAM user the owner of the public schema
+        # to allow CREATE TABLE operations
         if command -v psql &> /dev/null; then
-            log_info "Granting schema permissions to $db_user"
-            PGPASSWORD="$temp_password" psql "host=$instance_ip dbname=$DB_NAME user=postgres" -c \
-                "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO \"$db_user\"; \
-                 GRANT ALL ON SCHEMA public TO \"$db_user\"; \
-                 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"$db_user\"; \
-                 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO \"$db_user\";" \
-                2>/dev/null || log_warn "Failed to grant permissions - you may need to do this manually"
+            log_info "Granting schema permissions to $db_user (PostgreSQL 15+ compatible)"
+            
+            # First, allowlist our IP for connection
+            log_info "Allowlisting current IP for Cloud SQL connection..."
+            local current_ip
+            current_ip=$(curl -s ifconfig.me)
+            gcloud sql instances patch "$CLOUDSQL_INSTANCE_NAME" \
+                --project="$GCP_PROJECT_ID" \
+                --authorized-networks="$current_ip/32" \
+                --quiet 2>/dev/null || log_warn "Failed to allowlist IP - trying connection anyway"
+            
+            # Wait for the instance to be ready
+            sleep 5
+            
+            # Connect and grant permissions
+            # For PostgreSQL 15+: Explicitly grant CREATE on schema (not just ALL)
+            PGPASSWORD="$temp_password" psql "host=$instance_ip dbname=$DB_NAME user=postgres sslmode=require" -c "
+                -- Grant database-level privileges
+                GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO \"$db_user\";
+                
+                -- PostgreSQL 15+ requires explicit CREATE grant on schema
+                GRANT USAGE, CREATE ON SCHEMA public TO \"$db_user\";
+                
+                -- Grant privileges on existing tables/sequences
+                GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO \"$db_user\";
+                GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO \"$db_user\";
+                
+                -- Set default privileges for future objects created by postgres
+                ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public 
+                    GRANT ALL PRIVILEGES ON TABLES TO \"$db_user\";
+                ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public 
+                    GRANT ALL PRIVILEGES ON SEQUENCES TO \"$db_user\";
+            " 2>&1 || log_warn "Failed to grant permissions - you may need to do this manually"
+            
+            # Remove the IP allowlist (cleanup)
+            log_info "Cleaning up IP allowlist..."
+            gcloud sql instances patch "$CLOUDSQL_INSTANCE_NAME" \
+                --project="$GCP_PROJECT_ID" \
+                --clear-authorized-networks \
+                --quiet 2>/dev/null || true
         else
             log_warn "psql not installed - you'll need to grant database permissions manually:"
-            log_warn "  GRANT ALL ON SCHEMA public TO \"$db_user\";"
+            log_warn "  Connect to Cloud SQL as postgres and run:"
+            log_warn "  ALTER SCHEMA public OWNER TO \"$db_user\";"
+            log_warn "  GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO \"$db_user\";"
         fi
     else
         echo "[DRY-RUN] Would grant database permissions to $db_user"
@@ -1202,6 +1257,190 @@ setup_firewall() {
 }
 
 #------------------------------------------------------------------------------
+# Step 11: Build Golden VM Image (Optional)
+#------------------------------------------------------------------------------
+build_golden_image() {
+    log_step "Building Golden VM Image"
+
+    local IMAGE_NAME="reindeer-coder-v1"
+    local IMAGE_FAMILY="reindeer-coder"
+    local TEMP_VM="golden-image-builder-$(date +%s)"
+
+    # Check if image already exists
+    if gcloud compute images describe "$IMAGE_NAME" --project="$GCP_PROJECT_ID" &>/dev/null; then
+        if [[ "$REBUILD_IMAGE" != "true" ]]; then
+            log_info "Golden image $IMAGE_NAME already exists. Use --rebuild-image to recreate."
+            return 0
+        else
+            log_info "Deleting existing image $IMAGE_NAME for rebuild..."
+            run_cmd gcloud compute images delete "$IMAGE_NAME" --project="$GCP_PROJECT_ID" --quiet
+        fi
+    fi
+
+    log_info "Creating temporary VM for image building..."
+    run_cmd gcloud compute instances create "$TEMP_VM" \
+        --project="$GCP_PROJECT_ID" \
+        --zone="$GCP_ZONE" \
+        --machine-type=e2-standard-4 \
+        --image-family=ubuntu-2204-lts \
+        --image-project=ubuntu-os-cloud \
+        --boot-disk-size=50GB \
+        --network="$GCP_NETWORK" \
+        --tags=iap-ssh
+
+    echo ""
+    log_info "Waiting 60s for VM to be ready..."
+    sleep 60
+
+    log_info "Installing tools and configuring VM (this may take 3-5 minutes)..."
+    log_info "💡 Tip: View real-time progress in the Serial Console link above"
+    
+    # Create golden image setup script with proper variable substitution
+    local GOLDEN_SCRIPT_FILE
+    GOLDEN_SCRIPT_FILE=$(mktemp)
+    cat > "$GOLDEN_SCRIPT_FILE" << GOLDEN_EOF
+#!/bin/bash
+set -e
+
+VM_USER="${VM_USER}"
+
+echo "=== Creating \$VM_USER user with sudo ==="
+sudo useradd -m -s /bin/bash \$VM_USER || true
+sudo usermod -aG sudo \$VM_USER || true
+echo "\$VM_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/\$VM_USER
+sudo chmod 440 /etc/sudoers.d/\$VM_USER
+
+echo "=== Updating system packages ==="
+sudo apt-get update
+sudo apt-get install -y git curl wget tmux jq sudo python3 python3-pip
+
+echo "=== Installing Node.js 20.x ==="
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+sudo apt-get install -y nodejs
+
+echo "=== Installing pre-commit ==="
+sudo pip3 install pre-commit
+
+echo "=== Installing glab CLI ==="
+curl -fsSL https://raw.githubusercontent.com/upciti/wakemeops/main/assets/install_repository | sudo bash
+sudo apt-get install -y glab
+
+echo "=== Installing gh CLI ==="
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=\$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list
+sudo apt-get update && sudo apt-get install -y gh
+
+echo "=== Installing Claude CLI ==="
+sudo su - \$VM_USER -c "curl -fsSL https://claude.ai/install.sh | bash"
+sudo ln -sf /home/\$VM_USER/.local/bin/claude /usr/local/bin/claude 2>/dev/null || true
+
+echo "=== Installing Playwright dependencies ==="
+sudo apt-get install -y libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2
+sudo npx -y playwright@latest install chromium
+
+echo "=== Installing Gemini CLI ==="
+sudo npm install -g @google/gemini-cli || echo "Gemini CLI install failed, continuing..."
+
+echo "=== Installing Codex CLI ==="
+sudo npm install -g @openai/codex || echo "Codex CLI install failed, continuing..."
+
+echo "=== Configuring tmux for \$VM_USER user ==="
+sudo su - \$VM_USER -c 'cat > ~/.tmux.conf << TMUX_EOF
+# Enable mouse support for better scroll experience
+set -g mouse on
+
+# Increase scrollback buffer size
+set -g history-limit 50000
+
+# Use 256 colors
+set -g default-terminal "screen-256color"
+
+# Start window numbering at 1
+set -g base-index 1
+
+# Vi mode for copy mode
+setw -g mode-keys vi
+
+# Aggressive resize
+setw -g aggressive-resize on
+TMUX_EOF'
+
+echo "=== Configuring PATH for \$VM_USER user ==="
+NPM_BIN=\$(npm config get prefix)/bin
+# Add npm global bin and ~/.local/bin (for Claude CLI) to PATH
+echo "export PATH=\\\$PATH:\$NPM_BIN:\\\$HOME/.local/bin" | sudo tee -a /home/\$VM_USER/.bashrc
+echo "export PATH=\\\$PATH:\$NPM_BIN:\\\$HOME/.local/bin" | sudo tee -a /home/\$VM_USER/.profile
+
+echo "=== Pre-configuring Gemini CLI settings ==="
+sudo mkdir -p /home/\$VM_USER/.gemini
+sudo tee /home/\$VM_USER/.gemini/settings.json >/dev/null << GEMINI_EOF
+{
+  "security": {
+    "auth": {
+      "selectedType": "vertex-ai"
+    }
+  }
+}
+GEMINI_EOF
+sudo chown -R \$VM_USER:\$VM_USER /home/\$VM_USER/.gemini
+
+echo "=== Pre-configuring Codex CLI settings ==="
+sudo mkdir -p /home/\$VM_USER/.codex
+sudo tee /home/\$VM_USER/.codex/config.toml >/dev/null << CODEX_EOF
+# Codex CLI Configuration
+# Auto-generated by Reindeer Coder
+
+# Credentials storage: file-based for VM environments
+cli_auth_credentials_store = "file"
+CODEX_EOF
+sudo chown -R \$VM_USER:\$VM_USER /home/\$VM_USER/.codex
+
+echo "=== Setting git credential helper ==="
+sudo su - \$VM_USER -c "git config --global credential.helper store"
+
+echo "=== Cleaning up ==="
+sudo apt-get clean
+sudo rm -rf /var/lib/apt/lists/*
+
+echo "=== Golden image setup complete for user \$VM_USER! ==="
+GOLDEN_EOF
+
+    # Copy script to VM and execute
+    log_info "Copying setup script to VM..."
+    gcloud compute scp "$GOLDEN_SCRIPT_FILE" "$TEMP_VM:/tmp/golden-setup.sh" \
+        --zone="$GCP_ZONE" --project="$GCP_PROJECT_ID" --tunnel-through-iap --quiet
+    
+    log_info "Executing setup script on VM..."
+    gcloud compute ssh "$TEMP_VM" --zone="$GCP_ZONE" --project="$GCP_PROJECT_ID" \
+        --tunnel-through-iap --quiet --command="chmod +x /tmp/golden-setup.sh && sudo /tmp/golden-setup.sh"
+    
+    # Clean up local temp file
+    rm -f "$GOLDEN_SCRIPT_FILE"
+
+    log_info "Stopping VM for image creation..."
+    run_cmd gcloud compute instances stop "$TEMP_VM" --zone="$GCP_ZONE" --project="$GCP_PROJECT_ID"
+
+    log_info "Creating image from VM disk..."
+    run_cmd gcloud compute images create "$IMAGE_NAME" \
+        --project="$GCP_PROJECT_ID" \
+        --source-disk="$TEMP_VM" \
+        --source-disk-zone="$GCP_ZONE" \
+        --family="$IMAGE_FAMILY" \
+        --description="Reindeer Coder golden image (user: $VM_USER) with pre-installed tools (Node.js, Python, Claude CLI, Gemini CLI, Codex CLI, gh, glab, Playwright)"
+
+    log_info "Cleaning up temporary VM..."
+    run_cmd gcloud compute instances delete "$TEMP_VM" --zone="$GCP_ZONE" --project="$GCP_PROJECT_ID" --quiet
+
+    echo ""
+    log_success "Golden image $IMAGE_NAME created successfully!"
+    echo ""
+    log_info "To use this image, set in your deploy.config:"
+    echo "   VM_IMAGE_FAMILY=\"reindeer-coder\""
+    echo "   VM_IMAGE_PROJECT=\"$GCP_PROJECT_ID\""
+}
+
+#------------------------------------------------------------------------------
 # Print Summary
 #------------------------------------------------------------------------------
 print_summary() {
@@ -1371,6 +1610,13 @@ main() {
     if [[ "$DESTROY_MODE" == "true" ]]; then
         validate_config
         destroy_resources
+        exit 0
+    fi
+
+    # Handle --build-image mode
+    if [[ "$BUILD_IMAGE_MODE" == "true" ]]; then
+        validate_config
+        build_golden_image
         exit 0
     fi
 

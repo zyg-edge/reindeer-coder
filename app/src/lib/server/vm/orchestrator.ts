@@ -812,20 +812,24 @@ export async function startTask(taskId: string): Promise<void> {
 		appendTerminalBuffer(taskId, `[system] (This typically takes 30-90 seconds)\r\n\r\n`);
 
 		// Wait for SSH to become available - VMs need time to boot and start sshd
-		// Try connecting multiple times with increasing delays
+		// Try connecting immediately, then with progressive delays after failures
 		let conn: GcloudConnection | null = null;
 		const maxAttempts = 5;
-		const delays = [30000, 30000, 30000, 30000, 30000]; // 30s between attempts, total 2.5 min max
+		// Progressive delays: wait AFTER failure, not before first attempt
+		const retryDelays = [10000, 15000, 20000, 30000]; // 10s, 15s, 20s, 30s between retries
 
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-			const waitTime = delays[attempt - 1] / 1000;
-			appendTerminalBuffer(
-				taskId,
-				`[ssh] Attempt ${attempt}/${maxAttempts} - waiting ${waitTime}s before connecting...\r\n`
-			);
-
-			// Wait before attempting
-			await new Promise((resolve) => setTimeout(resolve, delays[attempt - 1]));
+			// Wait only after failed attempts (not before first attempt)
+			if (attempt > 1) {
+				const waitTime = retryDelays[attempt - 2] / 1000;
+				appendTerminalBuffer(
+					taskId,
+					`[ssh] Attempt ${attempt - 1} failed. Waiting ${waitTime}s before retry ${attempt}/${maxAttempts}...\r\n`
+				);
+				await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt - 2]));
+			} else {
+				appendTerminalBuffer(taskId, `[ssh] Attempting connection (attempt ${attempt}/${maxAttempts})...\r\n`);
+			}
 
 			appendTerminalBuffer(taskId, `[ssh] Attempting IAP tunnel connection to ${vmName}...\r\n`);
 
@@ -875,13 +879,19 @@ export async function startTask(taskId: string): Promise<void> {
 					}, 5000);
 				});
 
-				if (testResult) {
-					appendTerminalBuffer(taskId, '\r\n[system] SSH connection established!\r\n\r\n');
+			if (testResult) {
+				appendTerminalBuffer(taskId, '\r\n[system] SSH connection established!\r\n\r\n');
 
-					// Execute startup script via SSH with streaming output
-					await deployAndExecuteStartupScript(taskId, vmName, task.coding_cli, zone, project);
+				// Check if using golden image (tools pre-installed)
+				const useGoldenImage = imageFamily === 'reindeer-coder';
+				if (useGoldenImage) {
+					appendTerminalBuffer(taskId, '[system] Using golden image - skipping tool installation\r\n');
+				}
 
-					break;
+				// Execute startup script via SSH with streaming output
+				await deployAndExecuteStartupScript(taskId, vmName, task.coding_cli, zone, project, useGoldenImage);
+
+				break;
 				} else {
 					appendTerminalBuffer(taskId, `[ssh] Connection test failed, will retry...\r\n\r\n`);
 				}
@@ -966,6 +976,7 @@ export async function startTask(taskId: string): Promise<void> {
 
 		// Clone repository and run agent
 		const branchName = await generateBranchName(task);
+
 		appendTerminalBuffer(taskId, `\r\n========================================\r\n`);
 		appendTerminalBuffer(taskId, `[system] Executing setup commands\r\n`);
 		appendTerminalBuffer(taskId, `[system] Repository: ${task.repository}\r\n`);
@@ -1021,6 +1032,7 @@ export async function startTask(taskId: string): Promise<void> {
 
 		for (let i = 0; i < commands.length; i++) {
 			const { cmd, desc, isAgentStart, statusAfter } = commands[i];
+
 			appendTerminalBuffer(taskId, `\r\n[step ${i + 1}/${commands.length}] ${desc}\r\n`);
 			appendTerminalBuffer(taskId, `$ ${cmd}\r\n`);
 			conn.write(`${cmd}\n`);
@@ -1231,11 +1243,20 @@ export function resizeTerminal(taskId: string, cols: number, rows: number): void
 
 /**
  * Generate startup script for VM
+ * @param codingCli - The CLI tool to configure (claude-code, gemini, codex)
+ * @param useGoldenImage - If true, skip tool installation (tools pre-installed in golden image)
  */
-async function generateStartupScript(codingCli: string): Promise<string> {
+async function generateStartupScript(codingCli: string, useGoldenImage: boolean = false): Promise<string> {
 	const vmUser = await configService.get('vm.user', 'agent', 'VM_USER');
 
-	const baseScript = `#!/bin/bash
+	// User setup - only needed for base image (golden image has user pre-created)
+	const userSetup = useGoldenImage ? `#!/bin/bash
+set -e
+
+# Golden image detected - user and config already setup
+echo "Using golden image - user ${vmUser} already configured"
+
+` : `#!/bin/bash
 set -e
 
 # Create ${vmUser} user
@@ -1245,6 +1266,10 @@ usermod -aG sudo ${vmUser} || true
 echo "${vmUser} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${vmUser}
 chmod 440 /etc/sudoers.d/${vmUser}
 
+`;
+
+	// Tool installation (only needed for base image, not golden image)
+	const toolInstallation = useGoldenImage ? `` : `
 # Update system
 apt-get update
 apt-get install -y git curl wget tmux jq sudo
@@ -1293,6 +1318,10 @@ setw -g aggressive-resize on
 EOF
 "
 
+`;
+
+	// Credential configuration (ALWAYS needed - secrets are dynamic per-task)
+	const credentialSetup = `
 # Get service account for secret impersonation (if configured)
 SECRET_IMPERSONATE_SA=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/SECRET_IMPERSONATE_SA" -H "Metadata-Flavor: Google" || true)
 IMPERSONATE_FLAG=""
@@ -1401,27 +1430,16 @@ fi
 
 `;
 
-	const cliScripts: Record<string, string> = {
+	// Combine base script parts
+	const baseScript = userSetup + toolInstallation + credentialSetup;
+
+	// CLI installation scripts (only when NOT using golden image)
+	const cliInstallScripts: Record<string, string> = {
 		'claude-code': `
 # Install Claude Code as the VM user (native install - must use bash, not sh)
 su - ${vmUser} -c "curl -fsSL https://claude.ai/install.sh | bash"
 # Add to PATH for all users (installer puts it in ~/.local/bin)
 ln -sf /home/${vmUser}/.local/bin/claude /usr/local/bin/claude 2>/dev/null || true
-
-# Resolve Anthropic API key from Secret Manager at runtime (more secure)
-ANTHROPIC_API_KEY_SECRET=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/ANTHROPIC_API_KEY_SECRET" -H "Metadata-Flavor: Google" || true)
-if [ -n "$ANTHROPIC_API_KEY_SECRET" ]; then
-    echo "Resolving Anthropic API key from Secret Manager..."
-    export ANTHROPIC_API_KEY=$(gcloud secrets versions access "$ANTHROPIC_API_KEY_SECRET" $IMPERSONATE_FLAG 2>&1 | grep -v "^WARNING")
-    if [ -z "$ANTHROPIC_API_KEY" ] || echo "$ANTHROPIC_API_KEY" | grep -qi "error|denied|permission"; then
-        echo "Failed to resolve Anthropic API key: $ANTHROPIC_API_KEY"
-        export ANTHROPIC_API_KEY=""
-    else
-        echo "Anthropic API key resolved successfully"
-    fi
-fi
-echo "ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY}" >> /etc/environment
-echo "export ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY}" >> /home/${vmUser}/.bashrc
 
 # Install Playwright browsers for MCP
 # Install system dependencies for Chromium
@@ -1441,62 +1459,6 @@ for i in 1 2 3; do
         sleep 5
     fi
 done
-
-# Add npm global bin to PATH for ${vmUser} user
-NPM_BIN=$(npm config get prefix)/bin
-echo "export PATH=\\$PATH:$NPM_BIN" >> /home/${vmUser}/.bashrc
-echo "export PATH=\\$PATH:$NPM_BIN" >> /home/${vmUser}/.profile
-chown ${vmUser}:${vmUser} /home/${vmUser}/.bashrc /home/${vmUser}/.profile
-
-# Resolve Google API key from Secret Manager at runtime (if provided)
-GOOGLE_API_KEY_SECRET=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/GOOGLE_API_KEY_SECRET" -H "Metadata-Flavor: Google" || true)
-if [ -n "$GOOGLE_API_KEY_SECRET" ]; then
-    echo "Resolving Google API key from Secret Manager..."
-    GOOGLE_API_KEY=$(gcloud secrets versions access "$GOOGLE_API_KEY_SECRET" $IMPERSONATE_FLAG 2>&1 | grep -v "^WARNING" || echo "")
-fi
-if [ -n "$GOOGLE_API_KEY" ]; then
-    export GOOGLE_API_KEY=\${GOOGLE_API_KEY}
-    echo "export GOOGLE_API_KEY=\${GOOGLE_API_KEY}" >> /etc/environment
-fi
-
-# Configure ADC environment variables for Vertex AI (required for ADC authentication)
-# These are required when GOOGLE_API_KEY is not set and Gemini uses the VM's service account
-GOOGLE_CLOUD_PROJECT=$(curl -s "http://metadata.google.internal/computeMetadata/v1/project/project-id" -H "Metadata-Flavor: Google")
-export GOOGLE_CLOUD_PROJECT=\${GOOGLE_CLOUD_PROJECT}
-echo "export GOOGLE_CLOUD_PROJECT=\${GOOGLE_CLOUD_PROJECT}" >> /etc/environment
-echo "export GOOGLE_CLOUD_PROJECT=\${GOOGLE_CLOUD_PROJECT}" >> /home/${vmUser}/.bashrc
-
-# Set default location for Vertex AI (same zone as VM)
-export GOOGLE_CLOUD_LOCATION=us-central1
-echo "export GOOGLE_CLOUD_LOCATION=us-central1" >> /etc/environment
-echo "export GOOGLE_CLOUD_LOCATION=us-central1" >> /home/${vmUser}/.bashrc
-
-# Enable Vertex AI mode for Gemini CLI
-export GOOGLE_GENAI_USE_VERTEXAI=true
-echo "export GOOGLE_GENAI_USE_VERTEXAI=true" >> /etc/environment
-echo "export GOOGLE_GENAI_USE_VERTEXAI=true" >> /home/${vmUser}/.bashrc
-
-chown ${vmUser}:${vmUser} /home/${vmUser}/.bashrc
-
-# Pre-configure Gemini CLI settings to use Vertex AI authentication
-mkdir -p /home/${vmUser}/.gemini
-cat > /home/${vmUser}/.gemini/settings.json << 'GEMINI_SETTINGS_EOF'
-{
-  "security": {
-    "auth": {
-      "selectedType": "vertex-ai"
-    }
-  }
-}
-GEMINI_SETTINGS_EOF
-chown -R ${vmUser}:${vmUser} /home/${vmUser}/.gemini
-
-# Note: If GOOGLE_API_KEY is not set, Gemini CLI will use Application Default Credentials (ADC)
-# from the VM's service account, which requires:
-# 1. The VM service account to have "Vertex AI User" IAM role
-# 2. GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION to be set (configured above)
-# 3. GOOGLE_GENAI_USE_VERTEXAI=true to enable Vertex AI mode
-# 4. Pre-configured settings.json to select Vertex AI auth type
 `,
 		codex: `
 # Install Codex CLI with retry logic (npm registry can be flaky during VM startup)
@@ -1510,14 +1472,105 @@ for i in 1 2 3; do
         sleep 5
     fi
 done
+`,
+	};
 
+	// CLI configuration - secrets only (golden image has static config pre-baked)
+	const getCliConfigScript = (cli: string): string => {
+		if (cli === 'claude-code') {
+			return `
+# Resolve Anthropic API key from Secret Manager at runtime
+ANTHROPIC_API_KEY_SECRET=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/ANTHROPIC_API_KEY_SECRET" -H "Metadata-Flavor: Google" || true)
+if [ -n "$ANTHROPIC_API_KEY_SECRET" ]; then
+    echo "Resolving Anthropic API key from Secret Manager..."
+    export ANTHROPIC_API_KEY=$(gcloud secrets versions access "$ANTHROPIC_API_KEY_SECRET" $IMPERSONATE_FLAG 2>&1 | grep -v "^WARNING")
+    if [ -z "$ANTHROPIC_API_KEY" ] || echo "$ANTHROPIC_API_KEY" | grep -qi "error|denied|permission"; then
+        echo "Failed to resolve Anthropic API key: $ANTHROPIC_API_KEY"
+        export ANTHROPIC_API_KEY=""
+    else
+        echo "Anthropic API key resolved successfully"
+    fi
+fi
+echo "ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY}" >> /etc/environment
+echo "export ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY}" >> /home/${vmUser}/.bashrc
+`;
+		}
+
+		if (cli === 'gemini') {
+			// Golden image has PATH and settings.json pre-configured
+			const pathSetup = useGoldenImage ? '' : `
 # Add npm global bin to PATH for ${vmUser} user
 NPM_BIN=$(npm config get prefix)/bin
 echo "export PATH=\\$PATH:$NPM_BIN" >> /home/${vmUser}/.bashrc
 echo "export PATH=\\$PATH:$NPM_BIN" >> /home/${vmUser}/.profile
 chown ${vmUser}:${vmUser} /home/${vmUser}/.bashrc /home/${vmUser}/.profile
+`;
+			const settingsSetup = useGoldenImage ? '' : `
+# Pre-configure Gemini CLI settings to use Vertex AI authentication
+mkdir -p /home/${vmUser}/.gemini
+cat > /home/${vmUser}/.gemini/settings.json << 'GEMINI_SETTINGS_EOF'
+{
+  "security": {
+    "auth": {
+      "selectedType": "vertex-ai"
+    }
+  }
+}
+GEMINI_SETTINGS_EOF
+chown -R ${vmUser}:${vmUser} /home/${vmUser}/.gemini
+`;
+			return `${pathSetup}
+# Resolve Google API key from Secret Manager at runtime (if provided)
+GOOGLE_API_KEY_SECRET=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/GOOGLE_API_KEY_SECRET" -H "Metadata-Flavor: Google" || true)
+if [ -n "$GOOGLE_API_KEY_SECRET" ]; then
+    echo "Resolving Google API key from Secret Manager..."
+    GOOGLE_API_KEY=$(gcloud secrets versions access "$GOOGLE_API_KEY_SECRET" $IMPERSONATE_FLAG 2>&1 | grep -v "^WARNING" || echo "")
+fi
+if [ -n "$GOOGLE_API_KEY" ]; then
+    export GOOGLE_API_KEY=\${GOOGLE_API_KEY}
+    echo "export GOOGLE_API_KEY=\${GOOGLE_API_KEY}" >> /etc/environment
+fi
 
-# Resolve OpenAI API key from Secret Manager at runtime (more secure)
+# Configure ADC environment variables for Vertex AI (required for ADC authentication)
+GOOGLE_CLOUD_PROJECT=$(curl -s "http://metadata.google.internal/computeMetadata/v1/project/project-id" -H "Metadata-Flavor: Google")
+export GOOGLE_CLOUD_PROJECT=\${GOOGLE_CLOUD_PROJECT}
+echo "export GOOGLE_CLOUD_PROJECT=\${GOOGLE_CLOUD_PROJECT}" >> /etc/environment
+echo "export GOOGLE_CLOUD_PROJECT=\${GOOGLE_CLOUD_PROJECT}" >> /home/${vmUser}/.bashrc
+
+# Set default location for Vertex AI
+export GOOGLE_CLOUD_LOCATION=us-central1
+echo "export GOOGLE_CLOUD_LOCATION=us-central1" >> /etc/environment
+echo "export GOOGLE_CLOUD_LOCATION=us-central1" >> /home/${vmUser}/.bashrc
+
+# Enable Vertex AI mode for Gemini CLI
+export GOOGLE_GENAI_USE_VERTEXAI=true
+echo "export GOOGLE_GENAI_USE_VERTEXAI=true" >> /etc/environment
+echo "export GOOGLE_GENAI_USE_VERTEXAI=true" >> /home/${vmUser}/.bashrc
+
+chown ${vmUser}:${vmUser} /home/${vmUser}/.bashrc
+${settingsSetup}`;
+		}
+
+		if (cli === 'codex') {
+			// Golden image has PATH and config.toml pre-configured
+			const pathSetup = useGoldenImage ? '' : `
+# Add npm global bin to PATH for ${vmUser} user
+NPM_BIN=$(npm config get prefix)/bin
+echo "export PATH=\\$PATH:$NPM_BIN" >> /home/${vmUser}/.bashrc
+echo "export PATH=\\$PATH:$NPM_BIN" >> /home/${vmUser}/.profile
+chown ${vmUser}:${vmUser} /home/${vmUser}/.bashrc /home/${vmUser}/.profile
+`;
+			const configSetup = useGoldenImage ? '' : `
+# Pre-configure Codex CLI directory and config
+mkdir -p /home/${vmUser}/.codex
+cat > /home/${vmUser}/.codex/config.toml << 'CODEX_CONFIG_EOF'
+# Codex CLI Configuration
+cli_auth_credentials_store = "file"
+CODEX_CONFIG_EOF
+chown -R ${vmUser}:${vmUser} /home/${vmUser}/.codex
+`;
+			return `${pathSetup}
+# Resolve OpenAI API key from Secret Manager at runtime
 OPENAI_API_KEY_SECRET=$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/attributes/OPENAI_API_KEY_SECRET" -H "Metadata-Flavor: Google" || true)
 if [ -n "$OPENAI_API_KEY_SECRET" ]; then
     echo "Resolving OpenAI API key from Secret Manager..."
@@ -1525,13 +1578,8 @@ if [ -n "$OPENAI_API_KEY_SECRET" ]; then
 fi
 echo "export OPENAI_API_KEY=\${OPENAI_API_KEY}" >> /etc/environment
 echo "export OPENAI_API_KEY=\${OPENAI_API_KEY}" >> /home/${vmUser}/.bashrc
-
-# Pre-configure Codex CLI with API key authentication
-mkdir -p /home/${vmUser}/.codex
-chown -R ${vmUser}:${vmUser} /home/${vmUser}/.codex
-
+${configSetup}
 # Pre-authenticate Codex CLI as ${vmUser} user using API key
-# This creates ~/.codex/auth.json with cached credentials
 if [ -n "$OPENAI_API_KEY" ]; then
     echo "Pre-authenticating Codex CLI with API key..."
     if su - ${vmUser} -c "echo $OPENAI_API_KEY | codex login --with-api-key"; then
@@ -1542,26 +1590,17 @@ if [ -n "$OPENAI_API_KEY" ]; then
 else
     echo "WARNING: OPENAI_API_KEY not set, skipping Codex pre-auth"
 fi
+`;
+		}
 
-# Create config file to set approval mode preferences
-cat > /home/${vmUser}/.codex/config.toml << 'CODEX_CONFIG_EOF'
-# Codex CLI Configuration
-# Auto-generated by Vibe Coding platform
-
-# Credentials storage: file-based for VM environments
-cli_auth_credentials_store = "file"
-
-# Model selection (codex uses GPT-5-Codex by default)
-# default_model = "gpt-5-codex"
-CODEX_CONFIG_EOF
-chown -R ${vmUser}:${vmUser} /home/${vmUser}/.codex
-
-# Note: Codex uses --yolo flag (alias for --dangerously-bypass-approvals-and-sandbox)
-# for autonomous operation in sandboxed VM environments
-`,
+		return '';
 	};
 
-	return baseScript + (cliScripts[codingCli] || '');
+	// Build the CLI script based on golden image mode
+	const cliInstall = useGoldenImage ? '' : (cliInstallScripts[codingCli] || '');
+	const cliConfig = getCliConfigScript(codingCli);
+
+	return baseScript + cliInstall + cliConfig;
 }
 
 /**
@@ -1573,10 +1612,11 @@ async function deployAndExecuteStartupScript(
 	vmName: string,
 	codingCli: string,
 	zone: string,
-	project: string
+	project: string,
+	useGoldenImage: boolean = false
 ): Promise<void> {
 	// 1. Generate startup script
-	const startupScript = await generateStartupScript(codingCli);
+	const startupScript = await generateStartupScript(codingCli, useGoldenImage);
 
 	// 2. Write to local temp file
 	const localScriptPath = join(tmpdir(), `vibe-startup-${taskId}.sh`);

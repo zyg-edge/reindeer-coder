@@ -83,6 +83,20 @@ VM_USER="vibe"
 GCP_NETWORK="default"
 
 #------------------------------------------------------------------------------
+# VM Image Configuration
+#------------------------------------------------------------------------------
+# Use a golden image for faster VM spin-up (recommended for production)
+# Build the golden image first: ./scripts/deploy.sh --build-image
+#
+# Option 1: Golden Image (fast - ~45s spin-up)
+# VM_IMAGE_FAMILY="reindeer-coder"
+# VM_IMAGE_PROJECT=""  # Empty = use current project
+#
+# Option 2: Base Ubuntu (slower - ~5min spin-up, installs tools each time)
+VM_IMAGE_FAMILY="ubuntu-2204-lts"
+VM_IMAGE_PROJECT="ubuntu-os-cloud"
+
+#------------------------------------------------------------------------------
 # Cloud SQL Configuration
 #------------------------------------------------------------------------------
 # Instance name for Cloud SQL PostgreSQL
